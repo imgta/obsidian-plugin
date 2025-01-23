@@ -1,8 +1,32 @@
-/*
+.ribbon {
+    transition: all 200ms ease-in-out;
+    color: mediumpurple;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.ribbon:hover {
+    cursor: pointer;
+    color: mediumorchid;
+    transform: scale(1.2);
+}
 
-If your plugin does not need CSS, delete this file.
+.modal-btn {
+    cursor: pointer;
+    margin: 0.75rem 0.5rem 0.5rem 0;
+}
 
-*/
+.github-path {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-faint);
+    overflow-wrap: anywhere;
+    text-align: left;
+    padding: 0.5rem 0;
+}
+
+.modal-content h2 {
+    margin: 0;
+}
+
+.menu-item.tappable.selected:hover {
+    cursor: pointer;
+    transform: scale(1.025);
+}
