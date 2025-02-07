@@ -1,152 +1,88 @@
-import { App, Editor, MarkdownView, MarkdownFileInfo, Modal, Menu, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
-import git from 'isomorphic-git'
-import http from 'isomorphic-git/http/node'
-import { promises as fs, configureSingle } from '@zenfs/core'
-import { IndexedDB } from '@zenfs/dom'
+import { App, Events, Modal, Menu, Notice, Plugin, PluginManifest, PluginSettingTab, Setting } from 'obsidian';
 
-interface GitConfig {
-	githubUser: string
-	repositoryPath: string
-	vaultFolder: string
-	personalAccessToken: string
-}
+const DEFAULT_SETTINGS: WorldEditSettings = {
+	auth: {
+		id: '',
+		email: '',
+		refreshToken: '',
+		accessToken: '',
+		accessExpiry: null,
+	},
+	rootFolderId: '',
+};
 
-const DEFAULT_SETTINGS: GitConfig = {
-	githubUser: '',
-	repositoryPath: '',
-	vaultFolder: '',
-	personalAccessToken: '',
+class WorldEditEvents extends Events {
+	authUpdate(): void {
+		this.trigger('auth-updated');
+	}
 }
 
 export default class WorldEditPlugin extends Plugin {
-	settings: GitConfig = DEFAULT_SETTINGS;
-
-	async initZenDB() {
-		await configureSingle({
-			backend: IndexedDB,
-			storeName: 'worldedit-db',
-		})
+	settings: WorldEditSettings = DEFAULT_SETTINGS;
+	events: WorldEditEvents;
+	constructor(app: App, manifest: PluginManifest) {
+		super(app, manifest);
+		this.events = new WorldEditEvents();
 	}
 
-	private getRepoPath() {
-		const { githubUser, repositoryPath, vaultFolder, personalAccessToken } = this.settings;
-		if (!githubUser || !repositoryPath) {
-			return { error: 'Error: GitHub username and repositoryPath must be configured in the settings.' }
-		}
+	async saveSettings() { await this.saveData(this.settings); }
+	async loadSettings() {
+		const data = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data || {});
 
-		let url = `https://${personalAccessToken}@github.com/${githubUser}/${repositoryPath}`;
-		if (vaultFolder) { url += `/${vaultFolder}` }
-
-		const dir = `/${repositoryPath}`
-		return { url, dir }
-	}
-
-	private async gitPull() {
-		const status = new Notice('Pulling from GitHub...')
-		await this.initZenDB()
-
-		const { dir, url, error } = this.getRepoPath()
-		if (!dir && !url) { return status.setMessage(error as string) }
-
-		const isCloned = await fs
-			.stat(`${dir}/.git`)
-			.then(() => true)
-			.catch(() => false);
-
-		const gitOptions = { fs, dir, url }
-
-		if (!isCloned) { // clone
-			await git.addRemote({
-				...gitOptions,
-				remote: 'origin',
-			})
-			await git.clone({
-				...gitOptions,
-				http,
-				ref: 'main',
-				singleBranch: true,
-				depth: 1 // if you only need the latest
-			});
-		} else { // fetch + merge
-			await git.fetch({ ...gitOptions, http }); // fetch updates
-
-			const { githubUser } = this.settings;
-			await git.merge({
-				...gitOptions,
-				theirs: "remotes/origin/main",
-				author: { name: githubUser },
-			});
-		}
-
-		const files = await fs.readdir(dir);
-		const filteredFiles = files.filter(file => !file.startsWith('.git'));
-		new VaultListModal(this.app, filteredFiles).open();
-
-		// for (const file of files) {
-		// 	const content = await fs.readFile(`${dir}/${file}`, 'utf8')
-		// 	console.log(content)
-		// }
-
-		new Notice('Pull complete!')
-	}
-
-	private async gitPush() {
-		const status = new Notice('Pushing to GitHub...')
-		await this.initZenDB()
-
-		const { dir, url, error } = this.getRepoPath()
-		if (!dir && !url) { return status.setMessage(error as string) }
-
-		const gitOptions = { fs, dir }
-		const allFiles = await fs.readdir(dir);
-
-		// stage changes (add + commit)
-		for (const file of allFiles) {
-			// simple example - skip .git
-			if (file === ".git") continue;
-			await git.add({
-				...gitOptions,
-				filepath: file
-			});
-		}
-
-		const { githubUser, personalAccessToken } = this.settings;
-		const sha = await git.commit({ // commit changes
-			...gitOptions,
-			message: "Update notes from Obsidian",
-			author: {
-				name: githubUser,
-				email: `${githubUser}@users.noreply.github.com`
-			}
-		});
-		console.log("Committed with SHA:", sha);
-
-		await git.push({ // push changes
-			...gitOptions,
-			http,
-			ref: 'main',
-			remote: 'origin',
-			onAuth: () => ({ username: personalAccessToken }),
-		});
-
-		new Notice('Push complete!')
+		if (!data) { await this.saveSettings(); } // save only if data exists (creates new data.json)
 	}
 
 	async onload() {
-		console.log('Loading Git configurations...')
+		// action event listener for URI redirects to `obsidian://`
+		this.registerObsidianProtocolHandler('worldedit', async params => {
+			if (params.user) {
+				const [id, email] = params.user.split(':');
+				this.settings.auth.id = id;
+				this.settings.auth.email = email;
+
+				const res = await fetch('http://localhost:3000/api/vault/google', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ userId: id }),
+				});
+				const authData = await res.json();
+
+				if (authData) {
+					const { accessToken, expiry, refreshToken } = authData;
+					this.settings.auth.accessToken = accessToken;
+					this.settings.auth.refreshToken = refreshToken;
+					this.settings.auth.accessExpiry = expiry;
+
+					const res = await fetch('http://localhost:3000/api/vault/google/drive', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ refreshToken }),
+					});
+					const rootFolderId = await res.text();
+					if (rootFolderId) { this.settings.rootFolderId = rootFolderId; }
+				}
+
+				await this.saveSettings();
+				this.events.authUpdate(); // broadcast 'auth-updated' event after saving changes
+
+				new Notice('Successfully obtained refresh token!');
+			} else {
+				new Notice('Failed to obtain refresh token.');
+			}
+		});
+
 		await this.loadSettings();
 
 		// adds a settings tab for the plugin
-		this.addSettingTab(new GitConfigTab(this.app, this))
+		this.addSettingTab(new GoogleDriveTab(this.app, this));
 
 		// side ribbon button
 		this.addRibbonIcon('orbit', 'WorldEdit', (e: MouseEvent) => {
-			const menu = new Menu()
+			const menu = new Menu();
 
 			const options = [
-				{ title: 'Settings', icon: 'settings', action: () => new SettingsModal(this.app, this).open() },
-				{ title: 'Pull from GitHub', icon: 'arrow-down-to-line', action: () => this.gitPull() },
-				{ title: 'Push to GitHub', icon: 'arrow-up-from-line', action: () => this.gitPush() },
+				{ title: 'Settings', icon: 'settings', action: () => new GoogleDriveModal(this.app, this).open() },
 			];
 
 			options.forEach(option => {
@@ -154,41 +90,20 @@ export default class WorldEditPlugin extends Plugin {
 					.setTitle(option.title)
 					.setIcon(option.icon)
 					.onClick(option.action)
-				)
+				);
 			});
-			menu.showAtMouseEvent(e) // displays selectmenu at click position
-		}).addClass('ribbon')
-
-		this.addCommand({
-			id: 'view-pulled-files',
-			name: 'View Pulled Files',
-			callback: async () => {
-				const { dir, error } = this.getRepoPath();
-				if (!dir) { return new Notice(error as string); }
-
-				try {
-					const allFiles = await fs.readdir(dir);
-					const filteredFiles = allFiles.filter(
-						(file) => !file.startsWith('.git')
-					);
-
-					new VaultListModal(this.app, filteredFiles).open();
-				} catch (err) {
-					console.error('Error reading files:', err);
-					new Notice('Error reading repository files.');
-				}
-			},
-		});
-
+			menu.showAtMouseEvent(e); // displays selectmenu at click position
+		}).addClass('ribbon');
 	}
 
-	async onunload() { console.log("Unloading WorldEdit plugin..."); }
-
-	async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
-	async saveSettings() { await this.saveData(this.settings); }
+	async onunload() {
+		console.log("Unloading WorldEdit plugin...");
+	}
 }
 
-class GitConfigTab extends PluginSettingTab {
+// ------------------------------------------------------------
+
+class GoogleDriveTab extends PluginSettingTab {
 	plugin: WorldEditPlugin;
 	constructor(app: App, plugin: WorldEditPlugin) {
 		super(app, plugin);
@@ -196,152 +111,108 @@ class GitConfigTab extends PluginSettingTab {
 	}
 
 	display(): void {
-		buildSettings(
-			this.containerEl,
-			this.plugin.settings,
-			async () => { await this.plugin.saveSettings(); }
-		)
+		renderSettings(this);
 	}
 }
 
-class VaultListModal extends Modal {
-	files: string[];
-	selectedFiles: Set<string>;
-
-	constructor(app: App, files: string[]) {
-		super(app);
-		this.files = files;
-		this.selectedFiles = new Set();
-	}
-
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.empty();
-
-		contentEl.createEl('h2', { text: 'Select Vaults' });
-
-		if (this.files.length === 0) {
-			contentEl.createEl('p', { text: 'No vaults found.' });
-		} else {
-			const form = contentEl.createEl('form'); // form for better structure
-
-			this.files.forEach(file => {
-				const checkbox = form.createEl('input', { type: 'checkbox' });
-				checkbox.id = file
-				checkbox.onchange = () => this.toggleFileSelection(file, checkbox.checked);
-
-				const label = form.createEl('label', { text: file, attr: { for: file } });
-
-				const wrapper = form.createDiv({ cls: 'file-item' });
-				wrapper.appendChild(checkbox);
-				wrapper.appendChild(label);
-			});
-
-			const logButton = contentEl.createEl('button', { text: 'Log Vaults', cls: 'modal-btn' });
-			logButton.onclick = (e: MouseEvent) => {
-				e.preventDefault(); // prevent form submission behavior
-				this.logSelectedFiles();
-			};
-		}
-	}
-
-	toggleFileSelection(file: string, isSelected: boolean) {
-		if (isSelected) {
-			this.selectedFiles.add(file);
-		} else {
-			this.selectedFiles.delete(file);
-		}
-	}
-
-	logSelectedFiles() {
-		console.log('Selected Vaults:', Array.from(this.selectedFiles));
-		new Notice('Selected vaults logged to console!');
-	}
-
-	onClose() { this.contentEl.empty(); }
-}
-
-class SettingsModal extends Modal {
-	plugin: WorldEditPlugin
+class GoogleDriveModal extends Modal {
+	plugin: WorldEditPlugin;
 	constructor(app: App, plugin: WorldEditPlugin) {
 		super(app);
 		this.plugin = plugin;
+		this.setTitle('WorldEdit Settings');
 	}
-
 	onOpen() {
-		buildSettings(this.contentEl, this.plugin.settings, async () => {
-			await this.plugin.saveSettings()
-			this.close()
-		})
-		// cancel button for the modal
-		this.contentEl.createEl("button", { text: "Cancel", cls: 'modal-btn' }).onclick = () => this.close();
+		renderSettings(this); // initial modal UI render
+
+		// event listener to refresh modal UI with auth updates
+		this.plugin.events.on('auth-updated', async () => {
+			await this.plugin.loadSettings(); // reload latest settings
+			renderSettings(this); // rerender modal UI
+		});
 	}
 
-	onClose() { this.contentEl.empty(); }
+	onClose() {
+		this.plugin.events.off('auth-updated', () => { }); // clean up event listener
+		this.contentEl.empty();
+	}
 }
 
+// ------------------------------------------------------------
 
-function buildSettings(containerEl: HTMLElement, settings: GitConfig, saveSettings: () => Promise<void>) {
-	containerEl.empty();
-	containerEl.createEl("h2", { text: "WorldEdit Settings" });
+function authStatus(authSettings: UserAuth) {
+	const { refreshToken, email } = authSettings;
+	const attributes = refreshToken
+		? `stroke="mediumpurple" class="lucide lucide-badge-check"`
+		: `stroke="gray" class="lucide lucide-circle-alert"`;
+	const paths = refreshToken
+		? `<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/><path d="m9 12 2 2 4-4"/>`
+		: `<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>`;
+	const statusText = refreshToken
+		? email
+		: 'Google authentication required!';
 
-	const reactivePathEl = containerEl.createDiv({ cls: "github-path" });
-	const updateGithubPath = () => {
-		const { githubUser, repositoryPath, vaultFolder } = settings;
-		let githubPath = `github.com/`;
-		if (githubUser) githubPath += githubUser;
-		if (repositoryPath) githubPath += `/${repositoryPath}`;
-		if (vaultFolder) githubPath += `/${vaultFolder}`;
-		reactivePathEl.textContent = githubPath;
-	};
-	updateGithubPath();
+	return `<div class="header-container">
+			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ${attributes}>${paths}</svg>
+			<div class="header-status">${statusText}</div>
+			</div>`;
+}
 
-	new Setting(containerEl)
-		.setName("GitHub Username")
-		.setDesc("Enter your GitHub username.")
+function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
+	const container: HTMLElement = component instanceof GoogleDriveModal
+		? component.contentEl
+		: component.containerEl;
+
+	container.empty(); // clear existing content
+
+	if (component instanceof GoogleDriveTab) {
+		container.createEl("h2", { text: "WorldEdit Settings" });
+	}
+
+	const { settings, app } = component.plugin;
+
+	// displays current auth status
+	const statusHeader = container.createDiv({ cls: "header-status" });
+	statusHeader.innerHTML = authStatus(settings.auth);
+
+	// google refresh token input
+	new Setting(container)
+		.setName("Google refresh token")
+		.setDesc("Set or update Google refresh token.")
 		.addText(text => text
-			.setPlaceholder("imgta")
-			.setValue(settings.githubUser)
-			.onChange(value => { settings.githubUser = value; updateGithubPath(); })
-		);
-
-	new Setting(containerEl)
-		.setName("Repository")
-		.setDesc("Enter your repository name.")
-		.addText(text => text
-			.setPlaceholder("my-repo")
-			.setValue(settings.repositoryPath)
-			.onChange(value => { settings.repositoryPath = value; updateGithubPath(); })
-		);
-
-	const tokenDesc = document.createElement('div')
-	tokenDesc.innerHTML = `<p>Generate one <a href='https://github.com/settings/personal-access-tokens/new' target='_blank'>here</a>.</p>`
-	tokenDesc.setAttribute('class', 'setting-item-description')
-
-	new Setting(containerEl)
-		.setName("Personal Access Token")
-		.setDesc('Enter your GitHub Personal Access Token.')
-		.addText(text => text
-			.setPlaceholder("github_pat_...")
-			.setValue(settings.personalAccessToken)
-			.onChange(value => { settings.personalAccessToken = value; updateGithubPath(); })
+			.setPlaceholder("Enter refresh token...")
+			.setValue(settings.auth.refreshToken)
+			.onChange(input => {
+				settings.auth.refreshToken = input;
+			})
 			.inputEl.setAttribute("type", "password")
 		)
-	containerEl.appendChild(tokenDesc)
-
-	new Setting(containerEl)
-		.setName("Vault Folder (optional)")
-		.setDesc("Subdirectory for your vault in the repo.")
-		.addText(text => text
-			.setPlaceholder("vault_1")
-			.setValue(settings.vaultFolder)
-			.onChange(value => { settings.vaultFolder = value; updateGithubPath(); })
+		.addButton(button => button
+			.setButtonText(settings.auth.refreshToken ? "Renew" : "Obtain Token")
+			.setClass("world-btn")
+			.onClick(() => {
+				const vaultName = app.vault.getName();
+				window.open(`http://localhost:3000/auth?vault=${vaultName}`, "_blank");
+			})
 		);
 
-	// save button (optional for modal)
-	const saveButton = containerEl.createEl("button", { text: "Save", cls: 'modal-btn' });
+	// google drive obsidian folder id
+	new Setting(container)
+		.setName("Obsidian folder id:")
+		.setDesc("Google Drive Obsidian folder id.")
+		.addText(text => text
+			.setPlaceholder("Your vault folder id...")
+			.setValue(settings.rootFolderId)
+			.onChange(input => {
+				settings.rootFolderId = input;
+			})
+		);
+
+	const saveButton = container.createEl("button", { text: "Save", cls: "modal-btn" });
 	saveButton.onclick = async () => {
-		await saveSettings();
+		await component.plugin.saveSettings();
 		new Notice("Settings saved!");
+
+		if (component instanceof GoogleDriveModal) { component.close(); }
 	};
 }

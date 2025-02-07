@@ -1,32 +1,78 @@
 .ribbon {
     transition: all 200ms ease-in-out;
-    color: mediumpurple;
+    color: var(--color-accent);
+
+    &:hover {
+        cursor: pointer;
+        color: mediumorchid;
+        transform: scale(1.2);
+    }
 }
 
-.ribbon:hover {
-    cursor: pointer;
-    color: mediumorchid;
-    transform: scale(1.2);
+.modal {
+    backdrop-filter: blur(8px);
+    width: 67%;
+    background-color: calc(var(--modal-background));
+    padding: 1.5rem 2rem;
+}
+
+.modal-content > h2,
+.vertical-tab-content > h2,
+.modal-header {
+    font-size: var(--font-ui-large);
+    margin: 0;
 }
 
 .modal-btn {
-    cursor: pointer;
     margin: 0.75rem 0.5rem 0.5rem 0;
-}
-
-.github-path {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-faint);
-    overflow-wrap: anywhere;
-    text-align: left;
-    padding: 0.5rem 0;
-}
-
-.modal-content h2 {
-    margin: 0;
 }
 
 .menu-item.tappable.selected:hover {
     cursor: pointer;
     transform: scale(1.025);
+}
+
+.world-btn,
+.modal-btn,
+.modal-close-button {
+    cursor: pointer;
+}
+
+button.world-btn {
+    background-color: var(--color-accent);
+    color: var(--text-color);
+    box-shadow: var(--input-shadow);
+
+    &:hover {
+        filter: saturate(1.1) brightness(1.15);
+    }
+}
+
+.setting-tip {
+    padding-top: 0;
+}
+
+.setting-item-description {
+    padding-top: 0;
+    color: var(--text-faint);
+}
+
+
+.header-container {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    margin-top: 0.25rem;
+
+    .header-status {
+        font-size: var(--font-ui-smaller);
+        color: var(--text-faint);
+        overflow-wrap: anywhere;
+        text-align: left;
+        padding: 0.25rem 0 0.4rem 0.25rem;
+    }
+
+    svg {
+        margin-bottom: 0.125rem;
+    }
 }

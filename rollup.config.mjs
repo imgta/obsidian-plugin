@@ -8,7 +8,7 @@ export default {
         dir: '.',
         sourcemap: true,
         format: 'cjs', // obsidian plugins must be CommonJS
-        exports: 'default'
+        exports: 'named'
     },
     external: ['obsidian'], // let obsidian provide its own module at runtime
     plugins: [
