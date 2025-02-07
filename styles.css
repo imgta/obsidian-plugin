@@ -32,6 +32,13 @@
     transform: scale(1.025);
 }
 
+.world-dropdown option:first-child {
+    color: var(--text-faint);
+    font-style: italic;
+}
+
+.world-dropdown,
+.world-dropdown option,
 .world-btn,
 .modal-btn,
 .modal-close-button {

@@ -8,7 +8,15 @@ const DEFAULT_SETTINGS: WorldEditSettings = {
 		accessToken: '',
 		accessExpiry: null,
 	},
-	rootFolderId: '',
+	sync: {
+		rootFolders: [],
+		selectedFolder: {
+			id: '',
+			name: '',
+		},
+		vaultName: '',
+		lastSynced: null,
+	}
 };
 
 class WorldEditEvents extends Events {
@@ -36,6 +44,8 @@ export default class WorldEditPlugin extends Plugin {
 	async onload() {
 		// action event listener for URI redirects to `obsidian://`
 		this.registerObsidianProtocolHandler('worldedit', async params => {
+			this.settings.sync.vaultName = this.app.vault.getName();
+
 			if (params.user) {
 				const [id, email] = params.user.split(':');
 				this.settings.auth.id = id;
@@ -59,16 +69,19 @@ export default class WorldEditPlugin extends Plugin {
 						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify({ refreshToken }),
 					});
-					const rootFolderId = await res.text();
-					if (rootFolderId) { this.settings.rootFolderId = rootFolderId; }
+
+					const { files: rootFolders } = await res.json();
+					if (rootFolders.length) {
+						this.settings.sync.rootFolders = rootFolders;
+					}
 				}
 
 				await this.saveSettings();
 				this.events.authUpdate(); // broadcast 'auth-updated' event after saving changes
 
-				new Notice('Successfully obtained refresh token!');
+				new Notice('Authentication successful!');
 			} else {
-				new Notice('Failed to obtain refresh token.');
+				new Notice('Authentication failed.');
 			}
 		});
 
@@ -196,17 +209,54 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 			})
 		);
 
-	// google drive obsidian folder id
-	new Setting(container)
-		.setName("Obsidian folder id:")
-		.setDesc("Google Drive Obsidian folder id.")
-		.addText(text => text
-			.setPlaceholder("Your vault folder id...")
-			.setValue(settings.rootFolderId)
-			.onChange(input => {
-				settings.rootFolderId = input;
+	// gdrive sync folder selection
+	if (settings.sync.rootFolders?.length > 0) {
+		new Setting(container)
+			.setName('Select your sync folder')
+			.addDropdown(select => {
+				select.addOption('', 'Select a folder');
+				settings.sync.rootFolders.forEach(folder => {
+					select.addOption(folder.id, folder.name);
+				});
+
+				select.setValue(settings.sync.selectedFolder.id); // set initial dropdown select value
+
+				select.onChange(async value => {
+					const selectedFolder = settings.sync.rootFolders.find(folder => folder.id === value);
+					if (selectedFolder) {
+						settings.sync.selectedFolder = selectedFolder;
+					} else {
+						settings.sync.selectedFolder = { id: '', name: '' };
+					}
+
+					renderSettings(component); // re-render on change
+				});
+				select.selectEl.classList.add('world-dropdown');
 			})
-		);
+			.addButton(button => button
+				.setButtonText('Set Folder')
+				.setClass('world-btn')
+				.onClick(async () => {
+					await component.plugin.saveSettings();
+					new Notice('Sync folder updated!');
+				})
+
+				// disable button on placeholder option
+				.buttonEl.disabled = settings.sync.selectedFolder.id === ''
+			);
+	}
+
+	// // google drive obsidian folder id
+	// new Setting(container)
+	// 	.setName("Obsidian sync folder")
+	// 	.setDesc("Google Drive directory for vault syncing.")
+	// 	.addText(text => text
+	// 		.setPlaceholder("Sync folder id...")
+	// 		.setValue(settings.sync.folderId)
+	// 		.onChange(input => {
+	// 			settings.sync.folderId = input;
+	// 		})
+	// 	);
 
 	const saveButton = container.createEl("button", { text: "Save", cls: "modal-btn" });
 	saveButton.onclick = async () => {

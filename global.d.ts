@@ -14,9 +14,23 @@ declare global {
         accessExpiry: Date | null;
     }
 
+    interface GoogleDriveFileParams {
+        id: string;
+        name: string;
+        mimeType?: string;
+        size?: number;
+        createdTime?: string;
+        modifiedTime?: string;
+    }
+
     interface GoogleDriveConfig {
         auth: UserAuth;
-        rootFolderId: string;
+        sync: {
+            rootFolders: GoogleDriveFileParams[];
+            selectedFolder: GoogleDriveFileParams;
+            vaultName: string;
+            lastSynced: number | null;
+        };
     }
 
     interface WorldEditSettings extends GitHubSettings, GoogleDriveConfig { }
