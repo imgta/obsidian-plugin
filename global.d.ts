@@ -11,7 +11,7 @@ declare global {
         email: string;
         refreshToken: string;
         accessToken: string;
-        accessExpiry: Date | null;
+        accessExpiry: string;
     }
 
     interface GoogleDriveFileParams {
