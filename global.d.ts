@@ -19,17 +19,23 @@ declare global {
         name: string;
         mimeType?: string;
         size?: number;
-        createdTime?: string;
-        modifiedTime?: string;
+        createdTime?: Date | string;
+        modifiedTime?: Date | string;
+    }
+
+    interface VaultFileRecord {
+        gdriveId: string;
+        lastModified: number; // modification time in ms
     }
 
     interface GoogleDriveConfig {
         auth: UserAuth;
         sync: {
+            vaultName: string;
+            vaultRecord: { [filePath: string]: VaultFileRecord; };
             rootFolders: GoogleDriveFileParams[];
             selectedFolder: GoogleDriveFileParams;
-            vaultName: string;
-            lastSynced: number | null;
+            lastSync: Date | string;
         };
     }
 

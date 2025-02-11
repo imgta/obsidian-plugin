@@ -1,4 +1,4 @@
-import { App, Events, Modal, Menu, Notice, Plugin, PluginManifest, PluginSettingTab, Setting } from 'obsidian';
+import { App, Events, Modal, Menu, Notice, Plugin, PluginManifest, PluginSettingTab, Setting, debounce } from 'obsidian';
 
 const DEFAULT_SETTINGS: WorldEditSettings = {
 	auth: {
@@ -9,13 +9,11 @@ const DEFAULT_SETTINGS: WorldEditSettings = {
 		accessExpiry: '',
 	},
 	sync: {
-		rootFolders: [],
-		selectedFolder: {
-			id: '',
-			name: '',
-		},
 		vaultName: '',
-		lastSynced: null,
+		vaultRecord: {},
+		rootFolders: [],
+		selectedFolder: { id: '', name: '' },
+		lastSync: '',
 	}
 };
 
@@ -121,9 +119,11 @@ export default class WorldEditPlugin extends Plugin {
 
 class GoogleDriveTab extends PluginSettingTab {
 	plugin: WorldEditPlugin;
+	savedFolderId: string; // set saved selection as local property
 	constructor(app: App, plugin: WorldEditPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+		this.savedFolderId = plugin.settings.sync.selectedFolder.id;
 	}
 
 	display(): void {
@@ -133,9 +133,11 @@ class GoogleDriveTab extends PluginSettingTab {
 
 class GoogleDriveModal extends Modal {
 	plugin: WorldEditPlugin;
+	savedFolderId: string; // set saved selection as local property
 	constructor(app: App, plugin: WorldEditPlugin) {
 		super(app);
 		this.plugin = plugin;
+		this.savedFolderId = plugin.settings.sync.selectedFolder.id;
 		this.setTitle('WorldEdit Settings');
 	}
 	onOpen() {
@@ -155,24 +157,6 @@ class GoogleDriveModal extends Modal {
 }
 
 // ------------------------------------------------------------
-
-function authStatus(authSettings: UserAuth) {
-	const { refreshToken, email } = authSettings;
-	const attributes = refreshToken
-		? `stroke="mediumpurple" class="lucide lucide-badge-check"`
-		: `stroke="gray" class="lucide lucide-circle-alert"`;
-	const paths = refreshToken
-		? `<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/><path d="m9 12 2 2 4-4"/>`
-		: `<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>`;
-	const statusText = refreshToken
-		? email
-		: 'Google authentication required!';
-
-	return `<div class="header-container">
-			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ${attributes}>${paths}</svg>
-			<div class="header-status">${statusText}</div>
-			</div>`;
-}
 
 function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 	const container: HTMLElement = component instanceof GoogleDriveModal
@@ -216,15 +200,16 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 	if (settings.sync.rootFolders?.length > 0) {
 		new Setting(container)
 			.setName('Select your sync folder')
+			.setDesc('Google Drive folder to store Obsidian vault files.')
 			.addDropdown(select => {
 				select.addOption('', 'Select a folder');
 				settings.sync.rootFolders.forEach(folder => {
 					select.addOption(folder.id, folder.name);
 				});
-
-				select.setValue(settings.sync.selectedFolder.id); // set initial dropdown select value
+				select.setValue(settings.sync.selectedFolder.id); // set initial dropdown value
 
 				select.onChange(async value => {
+					// check if folder exists in gdrive root directory
 					const selectedFolder = settings.sync.rootFolders.find(folder => folder.id === value);
 					if (selectedFolder) {
 						settings.sync.selectedFolder = selectedFolder;
@@ -232,7 +217,7 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 						settings.sync.selectedFolder = { id: '', name: '' };
 					}
 
-					renderSettings(component); // re-render on change
+					renderSettings(component); // rerender settings UI
 				});
 				select.selectEl.classList.add('world-dropdown');
 			})
@@ -240,61 +225,87 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 				.setButtonText('Set Folder')
 				.setClass('world-btn')
 				.onClick(async () => {
+					component.savedFolderId = settings.sync.selectedFolder.id;
 					await component.plugin.saveSettings();
 					new Notice('Sync folder updated!');
 				})
 
-				// disable button on placeholder option
-				.buttonEl.disabled = !settings.sync.selectedFolder.id
+				// disable button on empty placeholder option
+				.buttonEl.disabled = !settings.sync.selectedFolder.id || settings.sync.selectedFolder.id === component.savedFolderId
 			);
 	}
 
-	// list obisidian vault files
-	new Setting(container)
-		.setName("Obsidian vault files")
-		.setDesc("List of all obsidian files.")
-		.addButton(button => button
-			.setButtonText('List files')
-			.setClass('world-btn')
-			.onClick(async () => {
-				const files = component.app.vault.getFiles();
-				console.log('files:', files);
-			})
-		);
-
 	// sync obsidian vault files
 	new Setting(container)
-		.setName("Sync Obsidian vault files.")
-		.setDesc("Sync files to Google Drive.")
+		.setName('Sync Obsidian vault files')
+		.setDesc('Sync Obsidian vault files to Google Drive.')
 		.addButton(button => button
 			.setButtonText('Sync')
 			.setClass('world-btn')
 			.onClick(async () => {
 				await syncVault(component.plugin);
-				new Notice('Starting sync!');
 			})
+			.setTooltip(`Last synced: ${humanDate(settings.sync.lastSync)}`, { delay: 100 })
 		);
 
-	const saveButton = container.createEl("button", { text: "Save", cls: "modal-btn" });
+	const saveButton = container.createEl('button', { text: 'Save', cls: ['modal-btn', 'world-btn'] });
 	saveButton.onclick = async () => {
 		await component.plugin.saveSettings();
-		new Notice("Settings saved!");
+		new Notice('Settings saved!');
 
 		if (component instanceof GoogleDriveModal) { component.close(); }
 	};
 }
 
+function authStatus(authSettings: UserAuth) {
+	const { refreshToken, email } = authSettings;
+	const attributes = refreshToken
+		? `stroke="mediumpurple" class="lucide lucide-badge-check"`
+		: `stroke="gray" class="lucide lucide-circle-alert"`;
+	const paths = refreshToken
+		? `<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/><path d="m9 12 2 2 4-4"/>`
+		: `<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>`;
+	const statusText = refreshToken
+		? email
+		: 'Google authentication required!';
+
+	return `<div class="header-container">
+			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ${attributes}>${paths}</svg>
+			<div class="header-status">${statusText}</div>
+			</div>`;
+}
+
+/**
+ * Converts UNIX timestamp to MMM DD, YYYY HH:MM AM/PM
+ *
+ * @param timestamp - A date object or string to be converted.
+ * @param showTime - A boolean indicating whether to show the HH:MM AM/PM time.
+ * @returns The human readable date string
+ */
+function humanDate(timestamp: Date | string, showTime = true) {
+	const date = new Date(timestamp);
+	const params: Record<string, string> = { year: 'numeric', month: 'short', day: 'numeric' };
+
+	if (showTime) {
+		params.hour = 'numeric';
+		params.minute = 'numeric';
+	}
+
+	return date.toLocaleDateString('en-US', params);
+}
+
+// ------------------------------------------------------------
+
 async function syncVault(plugin: WorldEditPlugin) {
+	const syncStatus = new Notice('Starting sync!');
 	const { settings, app } = plugin;
 	const vaultName = settings.sync.vaultName;
 	const rootFolderId = settings.sync.selectedFolder.id;
 
-
-	// check if access token is expired
+	// refresh access token if expired
 	const now = new Date();
 	const tokenExpired = now >= new Date(settings.auth.accessExpiry);
-	console.log('tokenExpired', tokenExpired);
-	if (tokenExpired) { // refresh access token
+	if (tokenExpired) {
 		const tokensRes = await fetch('http://localhost:3000/api/vault/google/tokens', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -307,22 +318,18 @@ async function syncVault(plugin: WorldEditPlugin) {
 		await plugin.saveSettings();
 	}
 
-
+	// create subfolder with vaultName in selectedFolder if it doesn't already exist
 	let vaultFolderId = '';
-	// check if subfolder with vaultName already exists in the root folder
 	const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
 		`name='${vaultName}' and '${rootFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
 	)}&fields=files(id,name)`, {
 		method: 'GET',
-		headers: {
-			'Authorization': `Bearer ${settings.auth.accessToken}`,
-		},
+		headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
 	});
 	const searchData = await searchRes.json();
 	if (searchData.files && searchData.files.length > 0) { // folder exists, use its folderId
 		vaultFolderId = searchData.files[0].id;
-		console.log(`Vault subfolder '${vaultName}' already exists with ID: ${vaultFolderId}`);
-	} else { // create subfolder named after the current vault
+	} else {
 		const createFolderRes = await fetch('https://www.googleapis.com/drive/v3/files', {
 			method: 'POST',
 			headers: {
@@ -342,49 +349,93 @@ async function syncVault(plugin: WorldEditPlugin) {
 			return;
 		}
 		vaultFolderId = createFolderData.id;
-		console.log(`Created new vault subfolder '${vaultName}' with ID: ${vaultFolderId}`);
+		console.log(`New vault folder '${vaultName}' created: ${vaultFolderId}`);
 	}
 
+	// process vault file upserts to google drive in batches
 	const files = app.vault.getFiles();
-	for (const file of files) {
-		const mimeType = getMimeType(file.extension);
-		let fileBlob: Blob;
+	const batchSize = 5;
+	for (let i = 0; i < files.length; i += batchSize) {
+		const batch = files.slice(i, i + batchSize);
 
-		// handle different file types
-		if (file.extension === 'md') {
-			const fileContent = await app.vault.read(file);
-			fileBlob = new Blob([fileContent], { type: 'text/markdown' });
-		} else {
-			const fileBinary = await app.vault.readBinary(file);
-			fileBlob = new Blob([fileBinary], { type: mimeType });
-		}
+		await Promise.all(batch.map(async file => {
+			// skip processing unchanged files
+			const fileModTime = file.stat.mtime;
+			const fileRecord = settings.sync.vaultRecord[file.path];
+			if (fileRecord?.lastModified >= fileModTime) {
+				console.log(`Skipping unchanged file: ${file.path}`);
+				return Promise.resolve();
+			}
 
-		// formdata object to send files to Google Drive
-		const formData = new FormData();
-		formData.append('metadata', new Blob([JSON.stringify({
-			name: file.path,
-			parents: [vaultFolderId],
-		})], { type: 'application/json' }));
-		formData.append('file', fileBlob);
+			const isUpdate = !!fileRecord?.gdriveId; // determine if update or new file
 
-		// upload to Google Drive
-		const uploadRes = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-			method: 'POST',
-			headers: {
-				'Authorization': `Bearer ${settings.auth.accessToken}`,
-			},
-			body: formData,
-		});
-		const uploadJson = await uploadRes.json();
-		if (!uploadJson.id) {
-			console.error(`Failed to upload ${file.path}:`, uploadJson);
-			new Notice(`Failed to upload ${file.path}`);
-		} else {
-			console.log(`File ${file.path} uploaded with ID: ${uploadJson.id}`);
-		}
+			// construct formdata object for google drive api call
+			const fileBuffer = ['md', 'txt'].includes(file.extension)
+				? await app.vault.read(file)
+				: await app.vault.readBinary(file);
+			const fileBlob = new Blob([fileBuffer], { type: getMimeType(file.extension) });
+			const metadataBlob = new Blob(
+				[
+					JSON.stringify({
+						name: file.path,
+						...(isUpdate ? {} : { parents: [vaultFolderId] }), // exclude parents field if updating
+					})
+				],
+				{ type: 'application/json' }
+			);
+			const formData = new FormData();
+			formData.append('metadata', metadataBlob);
+			formData.append('file', fileBlob);
+
+			// upsert vault file to google drive
+			const uploadURI = isUpdate
+				? `https://www.googleapis.com/upload/drive/v3/files/${fileRecord.gdriveId}?uploadType=multipart`
+				: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+			const upsertRes = await fetch(uploadURI, {
+				method: isUpdate ? 'PATCH' : 'POST',
+				headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
+				body: formData,
+			});
+			const upserted = await upsertRes.json();
+
+			if (!upserted.id) {
+				console.error(`Failed to upsert ${file.path}:`, upserted);
+				new Notice(`Failed to upsert ${file.path}`);
+				return;
+			}
+			console.log(`File ${file.path} upserted: ${upserted.id}`);
+
+			// update file's vault record
+			settings.sync.vaultRecord[file.path] = { gdriveId: upserted.id, lastModified: fileModTime };
+		}));
 	}
 
-	new Notice('Syncing Obsidian Vault to Google Drive completed!');
+	// prune locally deleted vault files from google drive
+	const localPaths = new Set(files.map(file => file.path));
+	const deletePromises = Object.entries(settings.sync.vaultRecord).map(async ([filePath, record]) => {
+		if (!localPaths.has(filePath)) {
+			const deleteRes = await fetch(`https://www.googleapis.com/drive/v3/files/${record.gdriveId}`, {
+				method: 'DELETE',
+				headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
+			});
+			if (deleteRes.ok) {
+				console.log(`Google Drive file removed: ${filePath}`);
+				delete settings.sync.vaultRecord[filePath];
+			} else {
+				console.error(`Failed to delete file: ${filePath}`);
+				new Notice(`Failed to delete ${filePath} from Google Drive`);
+			}
+		}
+	});
+	await Promise.all(deletePromises);
+
+	// update last sync timestamp
+	settings.sync.lastSync = new Date().toISOString();
+
+	// debounce notice update with 500ms delay
+	const updateSyncStatus = debounce((text: string) => { syncStatus.setMessage(text); }, 500, true);
+	updateSyncStatus('Google Drive sync complete!');
+	await plugin.saveSettings();
 }
 
 function getMimeType(extension: string): string {
@@ -395,10 +446,13 @@ function getMimeType(extension: string): string {
 		case 'jpg':
 		case 'jpeg': return 'image/jpeg';
 		case 'gif': return 'image/gif';
+		case 'webp': return 'image/webp';
 		case 'pdf': return 'application/pdf';
+		case 'json': return 'application/json';
 		case 'svg': return 'image/svg+xml';
 		case 'mp3': return 'audio/mpeg';
 		case 'mp4': return 'video/mp4';
+		case 'ogg': return 'video/ogg';
 		default: return 'application/octet-stream'; // default for unknown types
 	}
 }

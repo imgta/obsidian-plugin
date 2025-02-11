@@ -53,6 +53,11 @@ button.world-btn {
     &:hover {
         filter: saturate(1.1) brightness(1.15);
     }
+
+    &:disabled {
+        background-color: var(--interactive-normal);
+        filter: saturate(0);
+    }
 }
 
 .setting-tip {
