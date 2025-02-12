@@ -21,6 +21,7 @@ declare global {
         size?: number;
         createdTime?: Date | string;
         modifiedTime?: Date | string;
+        parents?: string[],
     }
 
     interface VaultFileRecord {

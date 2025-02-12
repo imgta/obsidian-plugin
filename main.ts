@@ -1,4 +1,4 @@
-import { App, Events, Modal, Menu, Notice, Plugin, PluginManifest, PluginSettingTab, Setting, debounce } from 'obsidian';
+import { App, Events, Modal, Menu, Notice, Plugin, PluginManifest, PluginSettingTab, Setting, debounce, TFile } from 'obsidian';
 
 const DEFAULT_SETTINGS: WorldEditSettings = {
 	auth: {
@@ -180,13 +180,14 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 		.setName("Google refresh token")
 		.setDesc("Set or update Google refresh token.")
 		.addText(text => text
-			.setPlaceholder("Enter refresh token...")
+			.setPlaceholder("Refresh token unset...")
 			.setValue(settings.auth.refreshToken)
 			.onChange(input => {
 				settings.auth.refreshToken = input;
 			})
 			.inputEl.setAttribute("type", "password")
 		)
+		.setDisabled(true)
 		.addButton(button => button
 			.setButtonText(settings.auth.refreshToken ? "Renew" : "Obtain Token")
 			.setClass("world-btn")
@@ -227,6 +228,7 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 				.onClick(async () => {
 					component.savedFolderId = settings.sync.selectedFolder.id;
 					await component.plugin.saveSettings();
+					renderSettings(component); // rerender settings UI
 					new Notice('Sync folder updated!');
 				})
 
@@ -235,18 +237,44 @@ function renderSettings(component: GoogleDriveTab | GoogleDriveModal) {
 			);
 	}
 
-	// sync obsidian vault files
-	new Setting(container)
-		.setName('Sync Obsidian vault files')
-		.setDesc('Sync Obsidian vault files to Google Drive.')
-		.addButton(button => button
-			.setButtonText('Sync')
-			.setClass('world-btn')
-			.onClick(async () => {
-				await syncVault(component.plugin);
-			})
-			.setTooltip(`Last synced: ${humanDate(settings.sync.lastSync)}`, { delay: 100 })
-		);
+	if (component.savedFolderId) {
+		// obsidian vault to google drive push sync
+		new Setting(container)
+			.setName('Sync Obsidian vault to Google Drive')
+			.setDesc('Push Obsidian vault files to Google Drive.')
+			.addButton(button => button
+				.setButtonText('Push Sync')
+				.setClass('world-btn')
+				.onClick(async () => {
+					await syncVaultToDrive(component.plugin);
+				})
+				.setTooltip(`Last synced: ${settings.sync.lastSync ? humanDate(settings.sync.lastSync) : 'never'}`, { delay: 100 })
+			);
+
+		// google drive to obsidian vault pull sync
+		new Setting(container)
+			.setName('Sync Google Drive to Obsidian vault')
+			.setDesc('Pull Google Drive files into Obsidian vault.')
+			.addButton(button => button
+				.setButtonText('Pull Sync')
+				.setClass('world-btn')
+				.onClick(async () => {
+					await syncDriveToVault(component.plugin);
+				})
+				.setTooltip(`Last synced: ${settings.sync.lastSync ? humanDate(settings.sync.lastSync) : 'never'}`, { delay: 100 })
+			);
+	}
+
+	// new Setting(container)
+	// 	.setName('Test')
+	// 	.addButton(button => button
+	// 		.setButtonText('Test')
+	// 		.setClass('world-btn')
+	// 		.onClick(async () => {
+	// 			console.log('app.vault.getRoot()', app.vault.getRoot());
+	// 			console.log('app.vault.getFiles()', app.vault.getFiles());
+	// 		})
+	// 	);
 
 	const saveButton = container.createEl('button', { text: 'Save', cls: ['modal-btn', 'world-btn'] });
 	saveButton.onclick = async () => {
@@ -296,14 +324,11 @@ function humanDate(timestamp: Date | string, showTime = true) {
 
 // ------------------------------------------------------------
 
-async function syncVault(plugin: WorldEditPlugin) {
-	const syncStatus = new Notice('Starting sync!');
-	const { settings, app } = plugin;
-	const vaultName = settings.sync.vaultName;
-	const rootFolderId = settings.sync.selectedFolder.id;
+async function validateAuthTokens(plugin: WorldEditPlugin) {
+	const { settings } = plugin;
+	const now = new Date();
 
 	// refresh access token if expired
-	const now = new Date();
 	const tokenExpired = now >= new Date(settings.auth.accessExpiry);
 	if (tokenExpired) {
 		const tokensRes = await fetch('http://localhost:3000/api/vault/google/tokens', {
@@ -318,69 +343,102 @@ async function syncVault(plugin: WorldEditPlugin) {
 		await plugin.saveSettings();
 	}
 
-	// create subfolder with vaultName in selectedFolder if it doesn't already exist
-	let vaultFolderId = '';
-	const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-		`name='${vaultName}' and '${rootFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
-	)}&fields=files(id,name)`, {
+	return settings.auth.accessToken;
+}
+
+async function validateDriveFolder(accessToken: string, parentFolderId: string, folderName: string) {
+	const query = encodeURIComponent(
+		`name='${folderName}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
+	);
+	const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`, {
 		method: 'GET',
-		headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
+		headers: { 'Authorization': `Bearer ${accessToken}` },
 	});
 	const searchData = await searchRes.json();
-	if (searchData.files && searchData.files.length > 0) { // folder exists, use its folderId
-		vaultFolderId = searchData.files[0].id;
-	} else {
-		const createFolderRes = await fetch('https://www.googleapis.com/drive/v3/files', {
-			method: 'POST',
-			headers: {
-				'Authorization': `Bearer ${settings.auth.accessToken}`,
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({
-				name: vaultName,
-				mimeType: 'application/vnd.google-apps.folder',
-				parents: [rootFolderId],
-			}),
-		});
-		const createFolderData = await createFolderRes.json();
-		if (!createFolderData.id) {
-			console.error('Failed to create subfolder:', createFolderData);
-			new Notice('Failed to create vault subfolder.');
-			return;
-		}
-		vaultFolderId = createFolderData.id;
-		console.log(`New vault folder '${vaultName}' created: ${vaultFolderId}`);
+
+	// folder exists--return the folder id
+	if (searchData.files.length > 0) { return searchData.files[0].id; }
+
+	// folder not found--create it and return the folder id
+	const folderRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+		method: 'POST',
+		headers: {
+			'Authorization': `Bearer ${accessToken}`,
+			'Content-Type': 'application/json',
+		},
+		body: JSON.stringify({
+			name: folderName,
+			mimeType: 'application/vnd.google-apps.folder',
+			parents: [parentFolderId],
+		}),
+	});
+	const folderData = await folderRes.json();
+	if (!folderData.id) {
+		console.error('Failed to create subfolder:', folderName);
+		new Notice('Failed to create subfolder.');
 	}
+	return folderData.id;
+}
+
+async function syncVaultToDrive(plugin: WorldEditPlugin) {
+	const syncStatus = new Notice('Starting (push) sync...');
+	const { settings, app } = plugin;
+	const vaultName = settings.sync.vaultName;
+	const rootFolderId = settings.sync.selectedFolder.id;
+	const syncResults: { [operation: string]: string[]; } = {
+		skips: [],
+		upserts: [],
+		deletes: [],
+	};
+
+	// get valid access token, refreshing if expired
+	const accessToken = await validateAuthTokens(plugin);
+
+	// verify vault folder exists in drive
+	const vaultFolderId = await validateDriveFolder(accessToken, rootFolderId, vaultName);
 
 	// process vault file upserts to google drive in batches
 	const files = app.vault.getFiles();
-	const batchSize = 5;
-	for (let i = 0; i < files.length; i += batchSize) {
-		const batch = files.slice(i, i + batchSize);
+	const CONCURRENCY_LIMIT = 5;
 
+	for (let i = 0; i < files.length; i += CONCURRENCY_LIMIT) {
+		const batch = files.slice(i, i + CONCURRENCY_LIMIT);
 		await Promise.all(batch.map(async file => {
 			// skip processing unchanged files
 			const fileModTime = file.stat.mtime;
 			const fileRecord = settings.sync.vaultRecord[file.path];
 			if (fileRecord?.lastModified >= fileModTime) {
-				console.log(`Skipping unchanged file: ${file.path}`);
+				syncResults.skips.push(file.path);
 				return Promise.resolve();
 			}
 
-			const isUpdate = !!fileRecord?.gdriveId; // determine if update or new file
+			const pathParts = file.path.split('/');
+			const fileName = pathParts.pop() ?? file.name;
+			let currentFolderId = vaultFolderId;
 
-			// construct formdata object for google drive api call
-			const fileBuffer = ['md', 'txt'].includes(file.extension)
+			// create necessary subfolders for nested files
+			if (pathParts.length > 0) {
+				for (const folderName of pathParts) {
+					currentFolderId = await validateDriveFolder(accessToken, currentFolderId, folderName);
+				}
+			}
+
+			// build formdata for google drive api call
+			const fileBuffer = ['md', 'txt', 'json'].includes(file.extension)
 				? await app.vault.read(file)
 				: await app.vault.readBinary(file);
 			const fileBlob = new Blob([fileBuffer], { type: getMimeType(file.extension) });
+
+			const isUpdate = !!fileRecord?.gdriveId; // determine if update or new file
+
+			// prep metadata and formdata
+			const metadataObj = {
+				name: fileName,
+				parents: isUpdate ? undefined : [currentFolderId], // exclude parents field if updating
+			};
+
 			const metadataBlob = new Blob(
-				[
-					JSON.stringify({
-						name: file.path,
-						...(isUpdate ? {} : { parents: [vaultFolderId] }), // exclude parents field if updating
-					})
-				],
+				[JSON.stringify(metadataObj)],
 				{ type: 'application/json' }
 			);
 			const formData = new FormData();
@@ -393,7 +451,7 @@ async function syncVault(plugin: WorldEditPlugin) {
 				: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
 			const upsertRes = await fetch(uploadURI, {
 				method: isUpdate ? 'PATCH' : 'POST',
-				headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
+				headers: { 'Authorization': `Bearer ${accessToken}` },
 				body: formData,
 			});
 			const upserted = await upsertRes.json();
@@ -401,25 +459,25 @@ async function syncVault(plugin: WorldEditPlugin) {
 			if (!upserted.id) {
 				console.error(`Failed to upsert ${file.path}:`, upserted);
 				new Notice(`Failed to upsert ${file.path}`);
-				return;
+				return Promise.resolve();
 			}
-			console.log(`File ${file.path} upserted: ${upserted.id}`);
+			syncResults.upserts.push(file.path);
 
 			// update file's vault record
 			settings.sync.vaultRecord[file.path] = { gdriveId: upserted.id, lastModified: fileModTime };
 		}));
 	}
 
-	// prune locally deleted vault files from google drive
+	// prune locally deleted vault files from remote google drive
 	const localPaths = new Set(files.map(file => file.path));
-	const deletePromises = Object.entries(settings.sync.vaultRecord).map(async ([filePath, record]) => {
+	const deletePromises = Object.entries(settings.sync.vaultRecord).map(async ([filePath, fileRecord]) => {
 		if (!localPaths.has(filePath)) {
-			const deleteRes = await fetch(`https://www.googleapis.com/drive/v3/files/${record.gdriveId}`, {
+			const deleteRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileRecord.gdriveId}`, {
 				method: 'DELETE',
-				headers: { 'Authorization': `Bearer ${settings.auth.accessToken}` },
+				headers: { 'Authorization': `Bearer ${accessToken}` },
 			});
 			if (deleteRes.ok) {
-				console.log(`Google Drive file removed: ${filePath}`);
+				syncResults.deletes.push(filePath);
 				delete settings.sync.vaultRecord[filePath];
 			} else {
 				console.error(`Failed to delete file: ${filePath}`);
@@ -429,13 +487,174 @@ async function syncVault(plugin: WorldEditPlugin) {
 	});
 	await Promise.all(deletePromises);
 
-	// update last sync timestamp
+	// update last sync timestamp and save settings
 	settings.sync.lastSync = new Date().toISOString();
+	await plugin.saveSettings();
 
-	// debounce notice update with 500ms delay
+	// debounce sync status notice update with 500ms delay
 	const updateSyncStatus = debounce((text: string) => { syncStatus.setMessage(text); }, 500, true);
 	updateSyncStatus('Google Drive sync complete!');
+	console.log(syncResults);
+}
+
+async function syncDriveToVault(plugin: WorldEditPlugin) {
+	const syncStatus = new Notice('Starting (pull) sync...');
+	const { settings, app } = plugin;
+	const vaultName = settings.sync.vaultName;
+	const rootFolderId = settings.sync.selectedFolder.id;
+	const syncResults: { [operation: string]: string[]; } = {
+		skips: [],
+		upserts: [],
+		deletes: [],
+	};
+
+	// get valid access token, refreshing if expired
+	const accessToken = await validateAuthTokens(plugin);
+
+	// verify vault folder exists in drive
+	const vaultFolderId = await validateDriveFolder(accessToken, rootFolderId, vaultName);
+
+	// create a map of file paths to drive files for easier lookups
+	const driveFileMap = new Map();
+	const CONCURRENCY_LIMIT = 5;
+	const folderQueue: { id: string, path: string[]; }[] = [{ id: vaultFolderId, path: [] }];
+
+	// recursively iterate through all parent folders to get all files in vault folder
+	while (folderQueue.length > 0) {
+		const currentBatch = folderQueue.splice(0, CONCURRENCY_LIMIT);
+
+		const batchResults = await Promise.all(
+			currentBatch.map(async folderItem => {
+				const folderFiles: any = { files: [], folderItem };
+				const query = encodeURIComponent(`'${folderItem.id}' in parents and trashed = false`);
+				const fields = 'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime)';
+				let pageToken: string | undefined = undefined;
+				do {
+					try {
+						const listURL = pageToken
+							? `https://www.googleapis.com/drive/v3/files?q=${query}&fields=${fields}&pageToken=${pageToken}`
+							: `https://www.googleapis.com/drive/v3/files?q=${query}&fields=${fields}`;
+						const res = await fetch(listURL, {
+							method: 'GET',
+							headers: { 'Authorization': `Bearer ${accessToken}` },
+						});
+						const listData = await res.json();
+
+						folderFiles.files.push(...(listData.files || []));
+						pageToken = listData.nextPageToken || undefined;
+					} catch (error) {
+						console.error('Error fetching folder contents:', error);
+					}
+				} while (pageToken);
+
+				return folderFiles;
+			})
+		);
+
+		for (const { files, folderItem } of batchResults) {
+			for (const file of files) {
+				const filePath = [...folderItem.path, file.name];
+
+				// add folders to queue for further processing
+				if (file.mimeType === 'application/vnd.google-apps.folder') {
+					folderQueue.push({ id: file.id, path: filePath });
+				} else { // add files to our file map
+					driveFileMap.set(filePath.join('/'), file);
+				}
+			}
+		}
+	}
+
+	// process drive file syncing in batches
+	const drivePaths = Array.from(driveFileMap.keys());
+	console.log('Drive files found:', drivePaths);
+
+	for (let i = 0; i < drivePaths.length; i += CONCURRENCY_LIMIT) {
+		const batch = drivePaths.slice(i, i + CONCURRENCY_LIMIT);
+
+		await Promise.all(batch.map(async filePath => {
+			const driveFile = driveFileMap.get(filePath);
+			const fileRecord = settings.sync.vaultRecord[filePath];
+			const localFile = app.vault.getAbstractFileByPath(filePath);
+
+			// if file exists locally and hasn't been modified, skip it
+			if (localFile && fileRecord?.gdriveId === driveFile.id) {
+				const driveModTime = new Date(driveFile.modifiedTime).getTime();
+				const localModTime = localFile instanceof TFile ? localFile.stat.mtime : 0;
+				console.log({ driveModTime, localModTime });
+				if (localModTime >= driveModTime) {
+					console.log('UP TO DATE!');
+					syncResults.skips.push(filePath);
+					return Promise.resolve();
+				}
+			}
+
+			// determine if file is non-downloadable, non-binary editor file (i.e. google docs, sheets, etc)
+			const isEditorFile = driveFile.mimeType.startsWith('application/vnd.google-apps');
+			const driveURL = `https://www.googleapis.com/drive/v3/files/${driveFile.id}` +
+				(isEditorFile
+					? `/export?mimeType=text/markdown` // if editor file, export content instead
+					: '?alt=media');
+
+			const updateRes = await fetch(driveURL, {
+				method: 'GET',
+				headers: { 'Authorization': `Bearer ${accessToken}` },
+			});
+
+			try {
+				if (!localFile) { // ensure parent folders exist
+					const folderPath = filePath.split('/').slice(0, -1).join('/');
+					if (folderPath) {
+						await app.vault.createFolder(folderPath).catch(() => {
+							// folder already exists, ignore error
+							console.log(`Folder already exists: ${folderPath}`);
+						});
+					}
+				}
+				if (isEditorFile) {
+					const newContent = await updateRes.text();
+					await app.vault.modify(localFile as TFile, newContent);
+				} else {
+					const newBinary = await updateRes.arrayBuffer();
+					await app.vault.adapter.writeBinary(filePath, newBinary);
+				}
+
+				// update sync results and vault record
+				syncResults.upserts.push(filePath);
+				settings.sync.vaultRecord[filePath] = {
+					gdriveId: driveFile.id,
+					lastModified: new Date(driveFile.modifiedTime).getTime(),
+				};
+			} catch (error) {
+				console.error(`Failed to sync file ${filePath}:`, error);
+				new Notice(`Failed to sync ${filePath}`);
+			}
+		}));
+	}
+
+	// delete local files that no longer exist in drive
+	const localFiles = app.vault.getFiles();
+	for (const file of localFiles) {
+		if (!driveFileMap.has(file.path) && settings.sync.vaultRecord[file.path]) {
+			try {
+				await app.vault.delete(file);
+				delete settings.sync.vaultRecord[file.path];
+				syncResults.deletes.push(file.path);
+			} catch (error) {
+				console.error(`Failed to delete file ${file.path}:`, error);
+				new Notice(`Failed to delete ${file.path}`);
+			}
+		}
+	}
+
+	// update last sync timestamp and save settings
+	settings.sync.lastSync = new Date().toISOString();
 	await plugin.saveSettings();
+
+	// debounce sync status notice update with 500ms delay
+	const updateSyncStatus = debounce((text: string) => { syncStatus.setMessage(text); }, 500, true);
+	updateSyncStatus('Vault sync complete!');
+	console.log(syncResults);
 }
 
 function getMimeType(extension: string): string {
