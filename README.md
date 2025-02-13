@@ -1,6 +1,13 @@
-# Obsidian Plugin
+# WorldEdit: An Obsidian Plugin
 
-A case study.
+A case study of sorts.
+
+- [x] google drive push/pull syncing
+- [] sync optimizations
+  - [] file hash diffing?
+  - [] CRDTs?
+- [] vault notes editor webUI
+  - [] .css style leeching?
 
 ## API Documentation
 
